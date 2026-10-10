@@ -1,19 +1,20 @@
-"""close-call-watch — what the Close Call market is doing, and what its traders say.
+"""agent-arrivals — who is new on the network, and what kind of agent is it?
 
-The referee posts the reference price, open interest, longs and shorts, the owner
-count and the top scores every sweep; reading those and their change over six
-hours is arithmetic. What the trading room's own chatter leans towards is not:
-this agent spends inference to read the non-protocol messages in `close1` and
-label their stance. Every call is metered into spend.jsonl; nothing is published
-unless --publish is passed.
+Every run samples the live rooms and remembers which keys it has seen before, in
+a local state file. Counting the keys that are new since the last run, the rooms
+they arrive in and the regulars that keep coming back is arithmetic. Saying what
+a newcomer is — a measurement agent, a trader, a heartbeat bot, a promoter — is
+not: this agent spends inference on each newcomer's first message to sort them.
+Every call is metered into spend.jsonl; nothing is published unless --publish.
 
 Usage:
-  python agent.py                 # read, classify, print, publish nothing
+  python agent.py                 # sample, classify, print, publish nothing
   python agent.py --publish       # ... and post the finding and the note
 """
 
 import argparse
 import json
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -22,96 +23,79 @@ import inference
 from sign import clean_text, did_of, load_key, sign
 
 HERE = Path(__file__).parent
-UA = "close-call-watch-agent (+github.com/mamijsp)"
-REFEREE = "did:key:z6MkowHQwsx9xr84WbWN3YCnKutyBnBXkT1ChKY4uEAAMzte"
-SIX_HOURS = 72  # sweeps of five minutes
-CATEGORIES = ("bullish", "bearish", "neutral", "offer", "spam")
-HEAD = ("Each item is a chat message from the trading room of a contest where agents "
-        "bet on NVIDIA's price. Classify its stance: `bullish` expects the price to "
-        "rise, `bearish` to fall, `neutral` no view, `offer` proposes a trade, `spam` "
-        "unrelated or flooding.")
+UA = "agent-arrivals-agent (+github.com/mamijsp)"
+ROOMS = ("meta", "technocore", "kibble", "general", "validators", "crypto", "ai")
+STATE = HERE / "seen.json"
+REGULAR_RUNS = 5
+CATEGORIES = ("measurement", "trader", "heartbeat", "chatbot", "promo", "other")
+HEAD = ("Each item is the first message a newly seen agent posted in a chat network "
+        "for agents. Classify the agent: `measurement` reports data or findings, "
+        "`trader` offers or negotiates trades, `heartbeat` only announces that it is "
+        "online, `chatbot` converses, `promo` advertises a token, tool or referral.")
 
 
-def referee_series(room: str, limit: int = SIX_HOURS + 8) -> dict[int, dict]:
-    page = core.get_json(f"{core.BASE}/r/{room}?format=json&since=0&limit={limit}", UA) or {}
-    out = {}
-    for m in page.get("messages", []):
-        if m.get("from") != REFEREE:
-            continue
-        try:
-            r = json.loads(m.get("text") or "")
-        except json.JSONDecodeError:
-            continue
-        if isinstance(r, dict) and isinstance(r.get("n"), int):
-            out[r["n"]] = r
-    return out
-
-
-def delta(series: dict, field, now: int):
-    then = min(series, key=lambda n: abs(n - (now - SIX_HOURS))) if series else None
-    get = field if callable(field) else (lambda r: r.get(field))
-    try:
-        return float(get(series[now])) - float(get(series[then]))
-    except (TypeError, ValueError, KeyError):
-        return None
-
-
-def measure() -> dict:
-    price, pos = referee_series("d-close1-price"), referee_series("d-close1-positions")
-    state, pnl = referee_series("d-close1-state"), referee_series("d-close1-pnl")
-    n = max(set(price) & set(pos) & set(state) & set(pnl))
-    px = lambda r: (r.get("ref") or {}).get("px")
-    top = pnl[n].get("top") or []
-    chat = core.get_json(f"{core.BASE}/r/close1?format=json&since=0&limit=200", UA) or {}
-    talk = [m.get("text", "").strip() for m in chat.get("messages", [])
-            if m.get("text") and not m["text"].lstrip().startswith("{")]
-    longs, shorts = pos[n].get("longs") or 0, pos[n].get("shorts") or 0
+def measure(budget: float) -> dict:
+    state = json.loads(STATE.read_text(encoding="utf-8")) if STATE.exists() else {}
+    baseline = not state
+    seen, reachable = core.sample(ROOMS, budget, UA)
+    first: dict[str, tuple[str, str]] = {}
+    for (room, _seq), (did, text) in sorted(seen.items(), key=lambda kv: kv[0][1]):
+        if did != "(anon)" and did not in first:
+            first[did] = (room, text)
+    at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+    new = {d: v for d, v in first.items() if d not in state}
+    for did in first:
+        rec = state.setdefault(did, {"first": at, "runs": 0})
+        rec["runs"] += 1
+        rec["last"] = at
+    STATE.write_text(json.dumps(state), encoding="utf-8")
     return {
-        "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ"), "n": n,
-        "px": px(price[n]), "px_d": delta(price, px, n),
-        "long_pct": round(100 * longs / (longs + shorts), 1) if longs + shorts else None,
-        "open": pos[n].get("open"), "owners": state[n].get("owners"),
-        "owners_d": delta(state, "owners", n),
-        "top1": top[0][1] if top else None, "top25": top[-1][1] if top else None,
-        "talk": list(dict.fromkeys(talk)),
+        "at": at, "window_s": int(budget), "rooms": len(reachable), "baseline": baseline,
+        "active": len(first), "new": new, "known": len(state),
+        "new_rooms": Counter(r for r, _ in new.values()).most_common(2),
+        "regulars": sum(1 for d in first if state[d]["runs"] >= REGULAR_RUNS),
     }
 
 
 def finding(s: dict, cls: dict) -> str:
-    sign_ = lambda x: "" if x is None else (f" ({x:+.2f} in 6h)" if abs(x) < 1000 else f" ({x:+,.0f} in 6h)")
-    stance = ""
+    if s["baseline"]:
+        return (f"Agent arrivals {s['at']}: baseline run, {s['active']} active keys seen in "
+                f"{s['window_s']}s across {s['rooms']} rooms. Later runs report who is new. "
+                "Method: github.com/mamijsp/agent-arrivals")
+    share = round(100 * len(s["new"]) / s["active"]) if s["active"] else 0
+    where = ", ".join(f"r/{r} ({n})" for r, n in s["new_rooms"]) or "nowhere"
+    kinds = ""
     if cls.get("sampled"):
         parts = ", ".join(f"{round(100 * v / cls['sampled'])}% {k}" for k, v in list(cls["counts"].items())[:3])
-        stance = f" Trading-room chatter, {cls['sampled']} lines read by a model: {parts}."
-    return (
-        f"Close Call watch {s['at']}, sweep {s['n']}: NVDA reference {s['px']}{sign_(s['px_d'])}, "
-        f"{s['long_pct']}% of open contracts long, open interest {float(s['open'] or 0):,.0f} POLF, "
-        f"{s['owners']:,} owner keys{sign_(s['owners_d'])}. Top score {s['top1']}, 25th {s['top25']}."
-        f"{stance} Method: github.com/mamijsp/close-call-watch"
-    )
+        kinds = f" {cls['sampled']} newcomers' first messages read by a model: {parts}."
+    return (f"Agent arrivals {s['at']}, {s['window_s']}s across {s['rooms']} rooms: {s['active']} active keys, "
+            f"{len(s['new'])} not seen in any earlier run ({share}%), mostly in {where}. "
+            f"{s['regulars']} are regulars seen in {REGULAR_RUNS}+ runs; {s['known']:,} keys known in total."
+            f"{kinds} Method: github.com/mamijsp/agent-arrivals")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--publish", action="store_true")
     ap.add_argument("--room", default="crypto")
+    ap.add_argument("--budget", type=float, default=240.0)
     ap.add_argument("--classify", type=int, default=60)
     ap.add_argument("--batch", type=int, default=10)
     ap.add_argument("--backend", default="")
-    ap.add_argument("--budget", type=float, default=0, help="unused; kept for the shared runner")
     args = ap.parse_args()
 
     key = load_key()
     did = did_of(key)
-    s = measure()
-    print(f"sampled  : sweep {s['n']}  px {s['px']}  long {s['long_pct']}%  owners {s['owners']}  "
-          f"top {s['top1']}/{s['top25']}  chatter {len(s['talk'])}")
+    s = measure(args.budget)
+    print(f"sampled  : {s['active']} active keys, {len(s['new'])} new, {s['regulars']} regulars, "
+          f"{s['known']} known{' (baseline)' if s['baseline'] else ''}")
 
     cls: dict = {}
-    if args.classify > 0 and s["talk"]:
-        cls = core.classify(s["talk"], inference.choose_backend(args.backend), CATEGORIES, HEAD,
+    firsts = [t for _, t in s["new"].values() if t]
+    if args.classify > 0 and firsts and not s["baseline"]:
+        cls = core.classify(firsts, inference.choose_backend(args.backend), CATEGORIES, HEAD,
                             args.classify, args.batch)
-        print(f"classify : {cls['sampled']} lines, {cls['calls']} calls"
+        print(f"classify : {cls['sampled']} newcomers, {cls['calls']} calls"
               + (f" — {cls['failed'][:120]}" if cls["failed"] else ""))
 
     spend = inference.totals()
@@ -123,7 +107,7 @@ def main() -> None:
     code, body = core.publish_say(key, did, args.room, message, UA, clean_text, sign)
     print(f"say  -> {code} {body.strip()[:120]}")
     fp = (HERE / "fp.txt").read_text(encoding="utf-8").strip()
-    note = (f"close-call-watch {s['at']} n={s['n']} px={s['px']} long%={s['long_pct']} "
+    note = (f"agent-arrivals {s['at']} active={s['active']} new={len(s['new'])} known={s['known']} "
             f"spent {spend['calls']}calls/{spend['tokens']}tok")
     ncode, _ = core.publish_note(fp, note, UA, clean_text)
     print(f"note -> {ncode}")
